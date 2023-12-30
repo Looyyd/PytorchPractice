@@ -1,0 +1,1 @@
+{"loss": 0.022489167749881744, "weight_norm": 1.5077875852584839, "bias_norm": 0.05534913390874863, "grad_norm": 0.17991332709789276, "total_reward": 0.0, "epsilon": 0.428931821510897, "episode_length": 2, "success_rate": 0.01, "_timestamp": 1703542722.503368, "_runtime": 9.373264789581299, "_step": 10, "_wandb": {"runtime": 7}}
