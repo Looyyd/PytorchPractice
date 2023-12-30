@@ -9,11 +9,11 @@ import random
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import optuna
-import wandb
 from tqdm import tqdm
 from gymnasium.envs.toy_text.frozen_lake import generate_random_map
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 # %%
 # Environment setup
@@ -57,6 +57,8 @@ class ConvNet(nn.Module):
 
         for out_channels in conv_layers:
             layers.append(ConvBlock(in_channels, out_channels))
+            # if dropout_p is not None:
+            # layers.append(nn.Dropout(dropout_p))
             in_channels = out_channels
 
         self.conv_layers = nn.Sequential(*layers)
@@ -69,6 +71,8 @@ class ConvNet(nn.Module):
     def forward(self, x):
         for layer in self.conv_layers:
             x = layer(x)
+            # if self.dropout_p is not None:
+            #    x = self.dropout(x)
 
         x = x.view(x.size(0), -1)
         if self.dropout_p is not None:
@@ -102,56 +106,45 @@ def actions_from_q_values(q_values, epsilon):
 device = torch.device("mps")
 
 
-# %%
-def preprocess_state(position, map_layout):
-    nrows, ncols = 4, 4  # Assuming a 4x4 map
-    num_statuses = 4  # Four statuses including the agent's position
+def convert_layout_to_tensor(map_layouts):
+    nrows, ncols = len(map_layouts[0]), len(map_layouts[0][0])
+    num_statuses = 4
+    batch_size = len(map_layouts)
 
-    # Initialize a 4x4x4 tensor for one-hot encoded state
-    state_tensor = np.zeros((nrows, ncols, num_statuses))
+    # Initialize a tensor for the batch of layouts
+    layout_tensor = torch.zeros((batch_size, nrows, ncols, num_statuses), device='cpu', dtype=torch.float)
 
-    # Decode map layout
-    layout_to_val = {b'F': 0, b'H': 1, b'S': 0, b'G': 3}  # Start 'S' also considered safe '0'
-
-    for i in range(nrows):
-        for j in range(ncols):
-            # Set the appropriate index in the one-hot vector
-            state_tensor[i, j, layout_to_val[map_layout[i][j]]] = 1
-
-    # Convert position to 2D coordinates and update in state tensor
-    row, col = divmod(position, ncols)
-    # Resetting the cell to a blank state before marking the current position
-    state_tensor[row, col] = np.array([0, 0, 0, 0])
-    state_tensor[row, col, 2] = 1  # Marking the current position with one-hot encoding
-
-    return torch.tensor(state_tensor, dtype=torch.float)
-
-
-def preprocess_states_batch(positions, map_layouts):
-    nrows, ncols = 4, 4  # Assuming a 4x4 map
-    num_statuses = 4  # Four statuses including the agent's position
-    batch_size = len(positions)
-
-    # Initialize a tensor for the batch of states
-    state_tensor = np.zeros((batch_size, nrows, ncols, num_statuses))
-
-    layout_to_val = {b'F': 0, b'H': 1, b'S': 0, b'G': 3}  # Start 'S' also considered safe '0'
+    layout_to_val = {b'F': 0, b'H': 1, b'S': 0, b'G': 3}
 
     for b in range(batch_size):
-        position = positions[b]
         map_layout = map_layouts[b]
 
-        for i in range(nrows):
-            for j in range(ncols):
-                state_tensor[b, i, j, layout_to_val[map_layout[i][j]]] = 1
+        # Vectorized operation for updating layout tensor
+        indices = torch.tensor([layout_to_val[item] for row in map_layout for item in row], device='cpu')
+        layout_tensor[b].view(-1, num_statuses).scatter_(1, indices.unsqueeze(1), 1)
 
-        # Convert position to 2D coordinates and update in state tensor
-        row, col = divmod(position, ncols)
-        # Resetting the cell to a blank state before marking the current position
-        state_tensor[b, row, col] = np.array([0, 0, 0, 0])
-        state_tensor[b, row, col, 2] = 1  # Marking the current position with one-hot encoding
+    return layout_tensor
 
-    return torch.tensor(state_tensor, dtype=torch.float)
+def update_start_positions(tensor_layout:Tensor, positions):
+    nrows, ncols, _ = tensor_layout.size()[1:4]
+
+    # Convert positions to a PyTorch tensor if it's not already one
+    if not isinstance(positions, torch.Tensor):
+        positions = torch.tensor(positions, dtype=torch.long, device=tensor_layout.device)
+
+    # Calculate rows and columns for all positions
+    rows = positions // ncols
+    cols = positions % ncols
+
+    # Reset the cells to [0, 0, 0, 0]
+    tensor_layout[torch.arange(positions.size(0)), rows, cols] = torch.tensor([0, 0, 0, 0], dtype=tensor_layout.dtype, device=tensor_layout.device)
+
+    # Set the start cells to [0, 0, 1, 0]
+    tensor_layout[torch.arange(positions.size(0)), rows, cols, 2] = 1
+
+    return tensor_layout
+
+
 
 
 # %%
@@ -160,10 +153,11 @@ print(env.desc)
 
 # %%
 class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, device='mps'):
+    def __init__(self, capacity, alpha=0.6, device='cpu'):
         self.alpha = alpha
         self.buffer = deque(maxlen=capacity)
         self.priorities = torch.zeros(capacity, device=device)
+        self.precomputed_probabilities = None  # New attribute
         self.next_priority_idx = 0
         self.device = device
 
@@ -185,17 +179,13 @@ class PrioritizedReplayBuffer:
             self.buffer.append((states[idx], actions[idx], rewards[idx], next_states[idx], dones[idx]))
             self.priorities[self.next_priority_idx] = max_priority
             self.next_priority_idx = (self.next_priority_idx + 1) % len(self.priorities)
+        self._update_probabilities()
 
     def sample(self, batch_size, beta=0.4):
-        if len(self.buffer) == 0:
+        if len(self.buffer) == 0 or self.precomputed_probabilities is None:
             return torch.empty(0), torch.empty(0, dtype=torch.long), torch.empty(0)
 
-        # Ensure non-zero priorities
-        priorities = self.priorities[:len(self.buffer)].clamp(min=1e-5)
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
-
-        indices = torch.from_numpy(np.random.choice(len(self.buffer), batch_size, p=probabilities.cpu().numpy())).long()
+        indices = torch.multinomial(self.precomputed_probabilities, batch_size, replacement=True)
 
         # Extracting the samples based on indices
         states, actions, rewards, next_states, dones = zip(*[self.buffer[idx] for idx in indices])
@@ -205,14 +195,20 @@ class PrioritizedReplayBuffer:
         next_states = torch.stack(next_states)
         dones = torch.stack(dones)
 
-        total = len(self.buffer)
-        weights = (total * probabilities[indices]) ** (-beta)
+        weights = (len(self.buffer) * self.precomputed_probabilities[indices]) ** (-beta)
         weights /= weights.max()
 
         return (states, actions, rewards, next_states, dones), indices, weights
 
-    def update_priorities(self, indices, errors):
-        self.priorities[indices] = torch.tensor(errors, device=self.device) + 1e-5
+    def update_priorities(self, indices, errors:Tensor):
+        self.priorities[indices] = errors.to(self.device) + 1e-5
+        self._update_probabilities()
+
+    def _update_probabilities(self):
+        # Update the precomputed probabilities based on current priorities
+        priorities = self.priorities[:len(self.buffer)].clamp(min=1e-5)
+        self.precomputed_probabilities = priorities ** self.alpha
+        self.precomputed_probabilities /= self.precomputed_probabilities.sum()
 
 
 # %%
@@ -229,17 +225,17 @@ def calculate_intermediate_reward(current_state, next_state, env, visited_states
         return forward_step_reward if next_state > current_state else 0
 
 
-def create_vectorized_environments(env_name, n_envs, random_map, is_slippery):
+def create_vectorized_environments(env_name, n_envs, random_map, is_slippery, size=4):
     if random_map:
-        envs = [gym.make(env_name, desc=generate_random_map(size=4), is_slippery=is_slippery) for _ in range(n_envs)]
+        envs = [gym.make(env_name, desc=generate_random_map(size=size), is_slippery=is_slippery) for _ in range(n_envs)]
     else:
         envs = [gym.make(env_name, is_slippery=is_slippery) for _ in range(n_envs)]
     return envs
 
 
-def create_environment(random_map, is_slippery):
+def create_environment(random_map, is_slippery, size=4):
     if random_map:
-        return gym.make('FrozenLake-v1', desc=generate_random_map(size=4), is_slippery=is_slippery)
+        return gym.make('FrozenLake-v1', desc=generate_random_map(size=size), is_slippery=is_slippery)
     else:
         return gym.make('FrozenLake-v1', is_slippery=is_slippery)
 
@@ -252,47 +248,49 @@ def update_model_using_replay_buffer(buffer: PrioritizedReplayBuffer, model, mod
     (states_batch, actions_batch, rewards, next_states_batch, dones), indices, weights = buffer.sample(batch_size,
                                                                                                        beta=beta)
 
-    # Compute the target Q-values
+    # Move data to device in one go to minimize transfers
+    states_batch, actions_batch, rewards, next_states_batch, dones, weights = (
+        states_batch.to(device), actions_batch.to(device), rewards.to(device),
+        next_states_batch.to(device), dones.to(device), weights.to(device)
+    )
+
+    # Optimize target Q-value computation
     with torch.no_grad():
-        next_q_values = model2(next_states_batch).gather(1, torch.argmax(model(next_states_batch), dim=1).unsqueeze(
-            -1)).squeeze()
+        next_state_values = model(next_states_batch)
+        next_q_values = model2(next_states_batch).gather(1, torch.argmax(next_state_values, dim=1).unsqueeze(-1)).squeeze()
         target_q_values = rewards + gamma * next_q_values * (1 - dones)
 
-    # Reshape actions_batch from [64] to [64, 1] to match the dimensions
     actions_batch = actions_batch.unsqueeze(-1)
-    # Compute current Q-values using the sampled states and actions
     current_q_values = model(states_batch).gather(1, actions_batch).squeeze(-1)
 
-    # Compute the loss
     loss = loss_fn(current_q_values, target_q_values)
 
-    # Calculate TD error for priority update
-    errors = torch.abs(current_q_values - target_q_values).detach().cpu().numpy()
+    errors = torch.abs(current_q_values - target_q_values).detach()
     buffer.update_priorities(indices, errors)
 
     loss = (loss * weights).mean()
 
-    # Rest of your optimization logic
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clipping_max_norm)
     optimizer.step()
 
+    grad_norm = None
     if return_grad_norm:
         grad_norm = sum(torch.norm(param.grad) ** 2 for param in model.parameters() if param.grad is not None)
-    else:
-        grad_norm = None
 
     return loss, grad_norm
 
 
 # Training Function
-def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, num_steps, device, n_states,
-                random_map=False, is_slippery=False, hole_reward=0, forward_step_reward=0, visited_step_reward=0,
-                in_place_reward=0, step_reward=0, minimum_epsilon=0.05, gradient_clipping_max_norm=10.0, batch_size=64,
-                buffer_alpha=0.6, beta=0.4, beta_increment=0.001, model2_step_update_frequency=750):
+def train_model(model, create_model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, num_steps, device,
+                n_states, random_map=False, is_slippery=False, hole_reward=0, forward_step_reward=0,
+                visited_step_reward=0, in_place_reward=0, step_reward=0, minimum_epsilon=0.05,
+                gradient_clipping_max_norm=10.0, batch_size=64, buffer_alpha=0.6, beta=0.4, beta_increment=0.001,
+                model2_step_update_frequency=750):
     n_envs = batch_size // 4
-    max_steps = 4 * 4 * 2
+    max_steps = n_states * 2
+    map_size = int(n_states ** 0.5)
     epsilon = epsilon_start
 
     last_eval_success_rate = 0  # metric that is sparsely updated
@@ -305,8 +303,7 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
         plot_update_frequency = 1
 
     # double Q learning
-    # TODO: flexible model
-    model2 = ConvNet(n_states, n_actions).to(device)
+    model2 = create_model(n_states, n_actions).to(device)
     model2.load_state_dict(model.state_dict())
     model2.eval()
 
@@ -314,7 +311,8 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
     buffer = PrioritizedReplayBuffer(capacity=10000, alpha=buffer_alpha)
     min_buffer_size = 1000
 
-    envs = create_vectorized_environments('FrozenLake-v1', n_envs, random_map, is_slippery)
+    envs = create_vectorized_environments('FrozenLake-v1', n_envs, random_map, is_slippery, size=map_size)
+    layouts = convert_layout_to_tensor([env.desc for env in envs])
     states = [env.reset()[0] for env in envs]
     visited_states = [set() for _ in envs]
     episode_steps_count = [0] * n_envs
@@ -336,9 +334,7 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
             visited_states[i].add(states[i])
 
         # Preprocess all states and convert them into tensors
-        state_tensors = [preprocess_state(state, env.desc) for state, env in zip(states, envs)]
-        # Combine all state tensors into a single batch
-        step_state_tensors = torch.stack(state_tensors).to(device)
+        step_state_tensors = update_start_positions(layouts, states).to(device)
 
         # Compute Q-values for the entire batch
         with torch.no_grad():
@@ -370,31 +366,18 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
             step_next_dones.append(done)
 
         # Store the transition in the replay buffer
-        # TODO: maybe store .desc somewhere
-        state_to_push = preprocess_states_batch(states, [env.desc for env in envs])
-        next_state_to_push = preprocess_states_batch(step_next_states, [env.desc for env in envs])
+        next_state_to_push = update_start_positions(layouts, step_next_states).to(device)
         experiences = []
-        for state, action, reward, next_state, done in zip(state_to_push, step_actions, step_rewards,
+        for state, action, reward, next_state, done in zip(step_state_tensors, step_actions, step_rewards,
                                                            next_state_to_push, step_next_dones):
             experiences.append((state, action, reward, next_state, done))
         # Push the batch of experiences to the buffer
         buffer.push(experiences)
 
-        # for i, (state, action, reward, next_state, done, env) in enumerate(zip(states, step_actions, step_rewards, step_next_states, step_next_dones, envs)):
-        #    buffer.push(preprocess_state(state, env.desc), action, reward, preprocess_state(next_state, env.desc), done)
-
         if len(buffer) > min_buffer_size:
             loss, _ = update_model_using_replay_buffer(buffer, model, model2, optimizer, loss_fn, gamma, device,
                                                        gradient_clipping_max_norm, batch_size, beta=beta)
 
-            # log metrics to wandb
-            wandb.log({"loss": loss.item(),
-                       "weight_norm": weight_norm.item(),
-                       "bias_norm": bias_norm.item(),
-                       # "grad_norm": grad_norm.item(),
-                       "epsilon": epsilon,
-                       "last_eval_success_rate": last_eval_success_rate,
-                       "beta": beta})
         # outside of buffer sampling
 
         # Update states of ongoing indices
@@ -404,7 +387,11 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
             else:
                 # generate new env
                 envs[i].close()  # TODO: is this necessary?
-                envs[i] = create_environment(random_map, is_slippery)
+                envs[i] = create_environment(random_map, is_slippery, size=map_size)
+                batched_desc = [envs[i].desc]
+                batched_convertion = convert_layout_to_tensor(batched_desc)
+                unbatched_conversion = batched_convertion[0]
+                layouts[i] = unbatched_conversion
                 states[i] = envs[i].reset()[0]
                 visited_states[i] = set()
                 episode_steps_count[i] = 0
@@ -415,7 +402,7 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
 
         if step > 0 and (step % plot_update_frequency == 0 or step == num_steps - 1):
             # update some metrics
-            last_eval_success_rate = evaluate_model(model, 1000, device, n_states, batch_size, is_slippery, random_map)
+            last_eval_success_rate = evaluate_model(model, 1000, device, n_states, batch_size*4, is_slippery, random_map)
             weight_norm = sum(torch.norm(param) ** 2 for param in model.parameters() if param.dim() > 1)
             bias_norm = sum(torch.norm(param) ** 2 for param in model.parameters() if param.dim() == 1)
 
@@ -428,20 +415,22 @@ def train_model(model, optimizer, loss_fn, gamma, epsilon_start, epsilon_decay, 
 
 # %%
 def evaluate_model(model, min_eval_episodes, device, n_states, batch_size=64, is_slippery=False, random_map=False):
+    map_size = int(n_states ** 0.5)
     model.eval()
     with torch.no_grad():
         successful_episodes = 0
         total_evaluated = 0
-        envs = [create_environment(random_map, is_slippery) for _ in range(batch_size)]
+        envs = create_vectorized_environments('FrozenLake-v1', batch_size, random_map, is_slippery, size=map_size)
         states = [env.reset()[0] for env in envs]
+        layouts = convert_layout_to_tensor([env.desc for env in envs])
         dones = [False] * len(envs)
-        max_steps = 4 * 4
+        max_steps = n_states
         episode_steps_count = [0] * len(envs)
 
         while total_evaluated < min_eval_episodes:
-            state_tensors = torch.stack([preprocess_state(state, env.desc) for state, env in zip(states, envs)]).to(
-                device)
-            actions = torch.argmax(model(state_tensors), dim=1).cpu().numpy()
+            state_tensors = update_start_positions(layouts, states).to(device)
+            q_values = model(state_tensors)
+            actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
             for i in range(len(envs)):
                 if not dones[i]:
@@ -454,7 +443,11 @@ def evaluate_model(model, min_eval_episodes, device, n_states, batch_size=64, is
                         total_evaluated += 1
 
                         if total_evaluated < min_eval_episodes:
-                            envs[i] = create_environment(random_map, is_slippery)
+                            envs[i] = create_environment(random_map, is_slippery, size=map_size)
+                            batched_desc = [envs[i].desc]
+                            batched_convertion = convert_layout_to_tensor(batched_desc)
+                            unbatched_conversion = batched_convertion[0]
+                            layouts[i] = unbatched_conversion
                             states[i] = envs[i].reset()[0]
                             episode_steps_count[i] = 0
                             dones[i] = False
@@ -467,10 +460,7 @@ def evaluate_model(model, min_eval_episodes, device, n_states, batch_size=64, is
 # %%
 # Optuna Objective Function
 def objective(trial):
-    wandb.init(project="frozenlake_slipperry_optuna_reward_search_convnet_random_map",
-               name=f"trial_{trial.number}",
-               config=trial.params,
-               reinit=True)
+
     # find rewards
     hole_reward = trial.suggest_float("hole_reward", -1, 0)
     forward_step_reward = trial.suggest_float("forward_step_reward", 0, 1)
@@ -500,30 +490,44 @@ def objective(trial):
     num_eval_episodes = 50
     success_rate = evaluate_model(trained_model, num_eval_episodes, device, n_states, is_slippery, random_map)
 
-    wandb.finish()
+
+
     return success_rate
 
 
+# %%
+"""
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=50)
+
+print("Best trial:")
+trial = study.best_trial
+print(f" Value: {trial.value}")
+print(" Params: ")
+for key, value in trial.params.items():
+    print(f"    {key}: {value}")
+"""
 # %%
 # Hyperparameters
 learning_rate = 0.0001
 gamma = 0.95
 epsilon = 0.6
-epsilon_decay = 0.99
+epsilon_decay = 0.999
 weight_decay = 1e-4
 dropout_p = 0.8
-forward_step_reward = 0  # 0.05
+forward_step_reward = 0.02
 visited_step_reward = 0
 hole_reward = 0  # -0.5
 in_place_reward = 0
 step_reward = 0  # -0.03
-min_epsilon = 0.1
+min_epsilon = 0.05
 gradient_clipping_max_norm = 2.0
 batch_size = 128
 buffer_alpha = 0.3
 beta = 0.4
 beta_increment = 0
 model2_step_update_frequency = 750
+layers = [16, 32, 64]
 # %%
 random_map = True
 is_slippery = False
@@ -531,35 +535,29 @@ is_slippery = False
 # Train the model
 num_steps = 1_000
 n_actions = env.action_space.n
-n_states = env.observation_space.n
-model = ConvNet(n_states, n_actions, dropout_p=dropout_p).to(device)
+size = 4
+n_states = size * size
+
+
+def create_convnet_model(n_states, n_actions):
+    return ConvNet(n_states, n_actions, conv_layers=layers, dropout_p=dropout_p)
+
+
+model = create_convnet_model(n_states, n_actions).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 loss_fn = nn.MSELoss()
-wandb.init(project="frozenlake_slipperry_batches_convnet_random_map",
-           name="Speed test",
-           reinit=True,
-           config={"learning_rate": learning_rate,
-                   "gamma": gamma,
-                   "epsilon": epsilon,
-                   "epsilon_decay": epsilon_decay,
-                   "weight_decay": weight_decay,
-                   "dropout_p": dropout_p,
-                   "num_steps": num_steps,
-                   "random_map": random_map,
-                   "is_slippery": is_slippery,
-                   "forward_step_reward": forward_step_reward,
-                   "visited_step_reward": visited_step_reward,
-                   "hole_reward": hole_reward,
-                   "in_place_reward": in_place_reward,
-                   "step_reward": step_reward,
-                   "minimum_epsilon": min_epsilon,
-                   "gradient_clipping_max_norm": gradient_clipping_max_norm,
-                   "batch_size": batch_size,
-                   "buffer_alpha": buffer_alpha,
-                   "beta": beta,
-                   "beta_increment": beta_increment,
-                   "model2_step_update_frequency": model2_step_update_frequency})
-model, _ = train_model(model, optimizer, loss_fn, gamma, epsilon, epsilon_decay, num_steps, device, n_states,
+
+parameter_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+# Estimate size in VRAM
+model_size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+model_size_megabytes = model_size_bytes / (1024 ** 2)
+print(f"Estimated Model Size in VRAM: {model_size_megabytes:.2f} MB")
+
+print(f"Parameter Count: {parameter_count:,} ")
+# %%
+
+model, _ = train_model(model, create_convnet_model, optimizer, loss_fn, gamma, epsilon, epsilon_decay, num_steps,
+                       device, n_states,
                        random_map=random_map, is_slippery=is_slippery,
                        forward_step_reward=forward_step_reward,
                        visited_step_reward=visited_step_reward,
@@ -573,4 +571,3 @@ model, _ = train_model(model, optimizer, loss_fn, gamma, epsilon, epsilon_decay,
                        beta=beta,
                        beta_increment=beta_increment,
                        model2_step_update_frequency=model2_step_update_frequency)
-wandb.finish()
