@@ -116,14 +116,20 @@ def convert_layout_to_tensor(map_layouts):
 
     layout_to_val = {b'F': 0, b'H': 1, b'S': 0, b'G': 3}
 
-    for b in range(batch_size):
-        map_layout = map_layouts[b]
+    # Precompute all indices for the batch
+    all_indices = [
+        layout_to_val[item]
+        for map_layout in map_layouts
+        for row in map_layout
+        for item in row
+    ]
+    indices_tensor = torch.tensor(all_indices, device='cpu').view(batch_size, nrows, ncols)
 
-        # Vectorized operation for updating layout tensor
-        indices = torch.tensor([layout_to_val[item] for row in map_layout for item in row], device='cpu')
-        layout_tensor[b].view(-1, num_statuses).scatter_(1, indices.unsqueeze(1), 1)
+    # Update the tensor using advanced indexing
+    layout_tensor.scatter_(3, indices_tensor.unsqueeze(3), 1)
 
     return layout_tensor
+
 
 def update_start_positions(tensor_layout:Tensor, positions):
     nrows, ncols, _ = tensor_layout.size()[1:4]
@@ -424,7 +430,7 @@ def evaluate_model(model, min_eval_episodes, device, n_states, batch_size=64, is
         states = [env.reset()[0] for env in envs]
         layouts = convert_layout_to_tensor([env.desc for env in envs])
         dones = [False] * len(envs)
-        max_steps = n_states
+        max_steps = n_states//2 # probably failing if it takes half the map to reach the goal
         episode_steps_count = [0] * len(envs)
 
         while total_evaluated < min_eval_episodes:
@@ -527,7 +533,7 @@ buffer_alpha = 0.3
 beta = 0.4
 beta_increment = 0
 model2_step_update_frequency = 750
-layers = [16, 32, 64]
+layers = [8, 16]
 # %%
 random_map = True
 is_slippery = False
