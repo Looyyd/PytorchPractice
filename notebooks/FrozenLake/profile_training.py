@@ -36,7 +36,7 @@ class Net(nn.Module):
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super(ConvBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False) # No bias needed due to BN
         self.bn = nn.BatchNorm2d(out_channels)
         self.match_channels = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
@@ -53,12 +53,13 @@ class ConvNet(nn.Module):
         if conv_layers is None:
             conv_layers = [16, 32]
         layers = []
-        in_channels = 4  # Initial number of channels
+        in_channels = 4
 
         for out_channels in conv_layers:
-            layers.append(ConvBlock(in_channels, out_channels))
-            # if dropout_p is not None:
-            # layers.append(nn.Dropout(dropout_p))
+            # Script each instance of ConvBlock
+            block = ConvBlock(in_channels, out_channels)
+            scripted_block = torch.jit.script(block)
+            layers.append(scripted_block)
             in_channels = out_channels
 
         self.conv_layers = nn.Sequential(*layers)
@@ -71,13 +72,12 @@ class ConvNet(nn.Module):
     def forward(self, x):
         for layer in self.conv_layers:
             x = layer(x)
-            # if self.dropout_p is not None:
-            #    x = self.dropout(x)
 
         x = x.view(x.size(0), -1)
         if self.dropout_p is not None:
             x = self.dropout(x)
         return self.fc(x)
+
 
 
 # %%
@@ -276,7 +276,7 @@ def update_model_using_replay_buffer(buffer: PrioritizedReplayBuffer, model, mod
 
     loss = (loss * weights).mean()
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clipping_max_norm)
     optimizer.step()
@@ -539,7 +539,7 @@ random_map = True
 is_slippery = False
 # %%
 # Train the model
-num_steps = 1_000
+num_steps = 100
 n_actions = env.action_space.n
 size = 4
 n_states = size * size
