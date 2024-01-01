@@ -36,9 +36,9 @@ class Net(nn.Module):
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super(ConvBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False) # No bias needed due to BN
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.match_channels = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False, dtype=torch.float16) # No bias needed due to BN
+        self.bn = nn.BatchNorm2d(out_channels, dtype=torch.float16)
+        self.match_channels = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, dtype=torch.float16)
 
     def forward(self, x):
         residual = self.match_channels(x)
@@ -63,13 +63,14 @@ class ConvNet(nn.Module):
             in_channels = out_channels
 
         self.conv_layers = nn.Sequential(*layers)
-        self.fc = nn.Linear(conv_layers[-1] * input_size, n_actions)
+        self.fc = nn.Linear(conv_layers[-1] * input_size, n_actions, dtype=torch.float16)
         self.dropout_p = dropout_p
 
         if dropout_p is not None:
             self.dropout = nn.Dropout(dropout_p)
 
     def forward(self, x):
+        x = x.to(memory_format=torch.channels_last)
         for layer in self.conv_layers:
             x = layer(x)
 
@@ -112,7 +113,7 @@ def convert_layout_to_tensor(map_layouts):
     batch_size = len(map_layouts)
 
     # Initialize a tensor for the batch of layouts
-    layout_tensor = torch.zeros((batch_size, nrows, ncols, num_statuses), device='cpu', dtype=torch.float)
+    layout_tensor = torch.zeros((batch_size, nrows, ncols, num_statuses), device='cpu', dtype=torch.float16)
 
     layout_to_val = {b'F': 0, b'H': 1, b'S': 0, b'G': 3}
 
@@ -176,9 +177,9 @@ class PrioritizedReplayBuffer:
 
         states = torch.stack(states).to(self.device)
         actions = torch.tensor(actions, device=self.device, dtype=torch.int64)
-        rewards = torch.tensor(rewards, device=self.device, dtype=torch.float32)
+        rewards = torch.tensor(rewards, device=self.device, dtype=torch.float16)
         next_states = torch.stack(next_states).to(self.device)
-        dones = torch.tensor(dones, device=self.device, dtype=torch.float32)
+        dones = torch.tensor(dones, device=self.device, dtype=torch.float16)
 
         max_priority = self.priorities.max().item()
         for idx in range(len(experiences)):
@@ -271,7 +272,12 @@ def update_model_using_replay_buffer(buffer: PrioritizedReplayBuffer, model, mod
 
     loss = loss_fn(current_q_values, target_q_values)
 
-    errors = torch.abs(current_q_values - target_q_values).detach()
+    # Convert to float16 before computing errors
+    current_q_values_f16 = current_q_values.to(torch.float16)
+    target_q_values_f16 = target_q_values.to(torch.float16)
+
+    # Compute errors as float16
+    errors = torch.abs(current_q_values_f16 - target_q_values_f16).detach()
     buffer.update_priorities(indices, errors)
 
     loss = (loss * weights).mean()
@@ -546,10 +552,10 @@ n_states = size * size
 
 
 def create_convnet_model(n_states, n_actions):
-    return ConvNet(n_states, n_actions, conv_layers=layers, dropout_p=dropout_p)
+    return ConvNet(n_states, n_actions, conv_layers=layers, dropout_p=dropout_p).to(device, memory_format=torch.channels_last)
 
 
-model = create_convnet_model(n_states, n_actions).to(device)
+model = create_convnet_model(n_states, n_actions)#.to(device, memory_format=torch.channels_last)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 loss_fn = nn.MSELoss()
 
