@@ -161,3 +161,6 @@ cython_debug/
 #.idea/
 
 /notebooks/wandb/
+*/wandb/
+
+/notebooks/FrozenLake/wandb/
